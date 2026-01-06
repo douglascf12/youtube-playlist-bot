@@ -36,7 +36,6 @@ jobs:
       - name: Run watcher
         env:
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
-          YT_CHANNEL_IDS: ${{ secrets.YT_CHANNEL_IDS }}
-          YT_PLAYLIST_ID: ${{ secrets.YT_PLAYLIST_ID }}
+          YT_CHANNEL_PLAYLIST_MAP: ${{ secrets.YT_CHANNEL_PLAYLIST_MAP }}
         run: |
           python watcher.py
