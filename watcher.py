@@ -16,7 +16,7 @@ SCOPES = ["https://www.googleapis.com/auth/youtube"]
 STATE_FILE = "state.json"
 
 MAX_VIDEOS_PER_CHANNEL = 2      # proteção de quota
-MAX_VIDEO_AGE_DAYS = 90         # ignora vídeos antigos
+MAX_VIDEO_AGE_DAYS = 150         # ignora vídeos antigos
 
 
 # ============================================================
