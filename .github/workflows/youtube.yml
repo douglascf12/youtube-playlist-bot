@@ -3,8 +3,8 @@ name: YouTube -> Playlist News
 on:
   workflow_dispatch:
   schedule:
-    # a cada 30 minutos (em UTC)
-    - cron: "*/30 * * * *"
+    # a cada 360 minutos (em UTC)
+    - cron: "*/360 * * * *"
 
 jobs:
   run:
