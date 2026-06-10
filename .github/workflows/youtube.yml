@@ -3,8 +3,8 @@ name: YouTube -> Playlist News
 on:
   workflow_dispatch:
   schedule:
-    # a cada 60 minutos (em UTC)
-    - cron: "*/60 * * * *"
+    # Toda hora, no minuto 0 (UTC)
+    - cron: "0 * * * *"
 
 jobs:
   run:
@@ -22,9 +22,13 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
-      # (Opcional) cache do state.json pra não resetar a cada run
+      - name: Run tests
+        run: |
+          pytest tests/ -v
+
+      # Cache do state.json para preservar histórico entre execuções
       - name: Cache state
         uses: actions/cache@v4
         with:
