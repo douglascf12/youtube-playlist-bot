@@ -119,13 +119,18 @@ class TestProcessChannel:
         """Helper: configura uploads e executa process_channel."""
         youtube_mock.playlistItems().list().execute.return_value = {"items": items}
         s = state if state is not None else {}
+        # Usar "if ... is not None" em vez de "or set()" para não descartar
+        # sets vazios (set() é falsy, então "existing or set()" criaria um
+        # set anônimo novo quando existing=set(), quebrando a referência)
+        liked_set = liked if liked is not None else set()
+        existing_set = existing if existing is not None else set()
         process_channel(
             youtube=youtube_mock,
             channel_id=CHANNEL,
             playlist_id=PLAYLIST,
             state=s,
-            liked_videos=liked or set(),
-            existing_playlist_videos=existing or set(),
+            liked_videos=liked_set,
+            existing_playlist_videos=existing_set,
         )
         return s
 
