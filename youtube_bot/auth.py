@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
@@ -40,13 +41,28 @@ def load_creds(state: dict[str, Any]) -> Credentials:
         Se as credenciais estiverem inválidas e não houver refresh_token
         (exige re-autenticação manual e atualização do Secret).
     """
-    info = json.loads(get_required_env("GOOGLE_TOKEN_JSON"))
+    try:
+        info = json.loads(get_required_env("GOOGLE_TOKEN_JSON"))
+    except json.JSONDecodeError:
+        # Nunca incluir o conteúdo do secret na mensagem de erro
+        raise RuntimeError("GOOGLE_TOKEN_JSON não é um JSON válido.") from None
+
     creds = Credentials.from_authorized_user_info(info, SCOPES)
 
     if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            logger.info("Access token expirado — renovando via refresh token...")
-            creds.refresh(Request())
+        if creds.refresh_token:
+            logger.info("Access token ausente/expirado — renovando via refresh token...")
+            try:
+                creds.refresh(Request())
+            except RefreshError as exc:
+                # invalid_grant: refresh token revogado ou expirado. Com o app
+                # OAuth em modo "Testing", o Google expira o token em 7 dias.
+                raise RuntimeError(
+                    "Falha ao renovar o token OAuth2 (refresh token revogado ou expirado). "
+                    "Rode `python bootstrap.py` e atualize o Secret GOOGLE_TOKEN_JSON. "
+                    "Dica: publique o app OAuth ('In production') para o token não expirar "
+                    f"em 7 dias. Detalhe: {exc}"
+                ) from exc
             state["_last_token_refresh"] = datetime.now(timezone.utc).isoformat()
             logger.info("Token renovado com sucesso.")
         else:

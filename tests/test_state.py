@@ -4,16 +4,13 @@ tests/test_state.py
 Testes unitários para youtube_bot.state.
 
 Cobertura:
-  - load_state: arquivo ausente, arquivo válido, conversão list→set
-  - save_state: persistência, conversão set→list, round-trip
+  - load_state: arquivo ausente, arquivo válido, ordem preservada, arquivo corrompido
+  - save_state: persistência, conversão set→list, round-trip, escrita atômica
   - is_processed: vídeo presente, ausente, canal ausente
-  - mark_processed: marcação, idempotência, trimming a 300
+  - mark_processed: marcação, idempotência, corte FIFO a 300
 """
 
 import json
-import os
-
-import pytest
 
 from youtube_bot.state import (
     is_processed,
@@ -21,7 +18,6 @@ from youtube_bot.state import (
     mark_processed,
     save_state,
 )
-
 
 # ---------------------------------------------------------------------------
 # load_state
@@ -48,16 +44,22 @@ class TestLoadState:
         assert "_last_token_refresh" in result
         assert "UCchannel1" in result
 
-    def test_converts_processed_list_to_set(self, tmp_path, monkeypatch):
-        """A lista 'processed' do JSON é convertida para set em memória."""
+    def test_preserves_processed_order(self, tmp_path, monkeypatch):
+        """A lista 'processed' é mantida em ordem (necessário para o corte FIFO)."""
         monkeypatch.chdir(tmp_path)
-        data = {"UCchannel1": {"processed": ["vid_001", "vid_002"]}}
+        data = {"UCchannel1": {"processed": ["vid_002", "vid_001"]}}
         (tmp_path / "state.json").write_text(json.dumps(data), encoding="utf-8")
 
         result = load_state()
 
-        assert isinstance(result["UCchannel1"]["processed"], set)
-        assert result["UCchannel1"]["processed"] == {"vid_001", "vid_002"}
+        assert result["UCchannel1"]["processed"] == ["vid_002", "vid_001"]
+
+    def test_corrupted_file_returns_empty_state(self, tmp_path, monkeypatch):
+        """Um state.json corrompido não derruba o bot."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "state.json").write_text("{not json", encoding="utf-8")
+
+        assert load_state() == {}
 
     def test_does_not_convert_non_channel_keys(self, tmp_path, monkeypatch):
         """Chaves internas (_liked_videos_cache, etc.) não são tocadas."""
@@ -103,7 +105,13 @@ class TestSaveState:
         save_state(state)
         loaded = load_state()
 
-        assert loaded["UCchannel1"]["processed"] == original_ids
+        assert set(loaded["UCchannel1"]["processed"]) == original_ids
+
+    def test_atomic_write_leaves_no_temp_files(self, tmp_path, monkeypatch):
+        """A escrita via arquivo temporário + os.replace não deixa lixo."""
+        monkeypatch.chdir(tmp_path)
+        save_state({"UCch": {"processed": ["v1"]}})
+        assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
 
     def test_preserves_non_channel_keys(self, tmp_path, monkeypatch):
         """Chaves internas como _liked_videos_cache são salvas sem alteração."""
@@ -172,6 +180,25 @@ class TestMarkProcessed:
         for i in range(350):
             mark_processed(state, "UCch", f"vid_{i:04d}")
         assert len(state["UCch"]["processed"]) <= 300
+
+    def test_trimming_discards_oldest_ids(self):
+        """O corte remove os IDs mais antigos e mantém os mais recentes."""
+        state: dict = {}
+        for i in range(305):
+            mark_processed(state, "UCch", f"vid_{i:04d}")
+
+        processed = state["UCch"]["processed"]
+        assert len(processed) == 300
+        assert "vid_0000" not in processed
+        assert "vid_0004" not in processed
+        assert processed[0] == "vid_0005"
+        assert processed[-1] == "vid_0304"
+
+    def test_accepts_legacy_set(self):
+        """States antigos com 'processed' como set continuam funcionando."""
+        state = {"UCch": {"processed": {"vid_001"}}}
+        mark_processed(state, "UCch", "vid_002")
+        assert set(state["UCch"]["processed"]) == {"vid_001", "vid_002"}
 
     def test_does_not_exceed_300_after_cap(self):
         """Adicionar mais vídeos após atingir o limite não ultrapassa 300."""

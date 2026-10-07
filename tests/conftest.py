@@ -4,7 +4,6 @@ conftest.py — fixtures compartilhadas entre todos os testes.
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Factories de state
 # ---------------------------------------------------------------------------

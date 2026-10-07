@@ -4,6 +4,8 @@ state.json
 # Credenciais e variáveis locais
 .env
 *.json.local
+token_output.json
+client_secret.json
 
 # Python
 __pycache__/

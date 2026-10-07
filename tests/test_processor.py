@@ -12,18 +12,21 @@ Cobertura:
     - vídeo curtido       → ignorado + marcado
     - vídeo elegível      → inserido + marcado + added++
     - limite MAX_VIDEOS_PER_CHANNEL → para após N inserções
-    - erro HTTP 403       → salva state e faz return
-    - erro HTTP 500       → propaga exceção
+    - 403 de quota        → QuotaExceededError
+    - 403 sem quota / 500 → propaga HttpError
+  - run: isolamento de falhas por canal e parada total por quota
 """
 
+import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from googleapiclient.errors import HttpError
 
-from youtube_bot.processor import is_recent, process_channel
-
+from youtube_bot.processor import is_recent, process_channel, run
+from youtube_bot.state import is_processed
+from youtube_bot.youtube_api import QuotaExceededError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,11 +48,12 @@ def make_playlist_item(video_id: str, days_ago: int) -> dict:
     }
 
 
-def make_http_error(status: int) -> HttpError:
-    """Cria um HttpError com o status code desejado."""
+def make_http_error(status: int, reason: str = "backendError") -> HttpError:
+    """Cria um HttpError com status e `reason` no formato real da API."""
     resp = MagicMock()
     resp.status = status
-    return HttpError(resp=resp, content=b"error")
+    content = json.dumps({"error": {"code": status, "errors": [{"reason": reason}]}})
+    return HttpError(resp=resp, content=content.encode())
 
 
 # ---------------------------------------------------------------------------
@@ -83,24 +87,14 @@ class TestIsRecent:
 # process_channel — setup
 # ---------------------------------------------------------------------------
 
-CHANNEL = "UCtest_channel"
+CHANNEL = "UC" + "a" * 22
 PLAYLIST = "PLtest_playlist"
-UPLOADS_PLAYLIST = "UUtest_uploads"
 
 
 @pytest.fixture
 def youtube_mock():
-    """Mock do cliente YouTube com uploads_playlist configurado."""
-    mock = MagicMock()
-    # get_uploads_playlist_id
-    mock.channels().list().execute.return_value = {
-        "items": [{
-            "contentDetails": {
-                "relatedPlaylists": {"uploads": UPLOADS_PLAYLIST}
-            }
-        }]
-    }
-    return mock
+    """Mock do cliente YouTube (a playlist de uploads é derivada, sem API)."""
+    return MagicMock()
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +189,7 @@ class TestProcessChannel:
 
     # --- limite MAX_VIDEOS_PER_CHANNEL ---
 
-    @patch("youtube_bot.processor.MAX_VIDEOS_PER_CHANNEL", 2)
+    @patch("youtube_bot.config.MAX_VIDEOS_PER_CHANNEL", 2)
     def test_respects_max_videos_per_channel(self, youtube_mock):
         """Insere no máximo MAX_VIDEOS_PER_CHANNEL vídeos por execução."""
         items = [
@@ -210,15 +204,25 @@ class TestProcessChannel:
 
     # --- tratamento de erros ---
 
-    def test_returns_on_403_quota_exceeded(self, youtube_mock):
-        """Em erro 403, salva state e retorna sem propagar exceção."""
-        youtube_mock.playlistItems().insert().execute.side_effect = make_http_error(403)
+    def test_quota_error_propagates_as_quota_exceeded(self, youtube_mock):
+        """403 de quota vira QuotaExceededError para o orquestrador parar tudo."""
+        youtube_mock.playlistItems().insert().execute.side_effect = make_http_error(
+            403, reason="quotaExceeded"
+        )
         items = [make_playlist_item("vid_new", 10)]
 
-        # Não deve lançar exceção
-        with patch("youtube_bot.processor.save_state") as mock_save:
+        with pytest.raises(QuotaExceededError):
             self._run(youtube_mock, items)
-            mock_save.assert_called_once()
+
+    def test_forbidden_403_is_not_treated_as_quota(self, youtube_mock):
+        """403 sem motivo de quota (ex.: sem permissão) propaga como HttpError."""
+        youtube_mock.playlistItems().insert().execute.side_effect = make_http_error(
+            403, reason="forbidden"
+        )
+        items = [make_playlist_item("vid_new", 10)]
+
+        with pytest.raises(HttpError):
+            self._run(youtube_mock, items)
 
     def test_raises_on_non_403_http_error(self, youtube_mock):
         """Erros HTTP diferentes de 403 devem ser propagados."""
@@ -228,16 +232,40 @@ class TestProcessChannel:
         with pytest.raises(HttpError):
             self._run(youtube_mock, items)
 
+    def test_failed_insert_does_not_mark_processed(self, youtube_mock):
+        """Se a inserção falhar, o vídeo deve ser tentado de novo na próxima execução."""
+        youtube_mock.playlistItems().insert().execute.side_effect = make_http_error(500)
+        state: dict = {}
+        with pytest.raises(HttpError):
+            self._run(youtube_mock, [make_playlist_item("vid_new", 10)], state=state)
+
+        assert not is_processed(state, CHANNEL, "vid_new")
+
+    def test_uses_video_published_at_from_content_details(self, youtube_mock):
+        """videoPublishedAt (data real) tem prioridade sobre snippet.publishedAt."""
+        item = make_playlist_item("vid_old_reupload", 1)
+        item["contentDetails"] = {"videoPublishedAt": make_iso(400)}
+        self._run(youtube_mock, [item])
+
+        youtube_mock.playlistItems().insert.assert_not_called()
+
+    def test_does_not_call_channels_list(self, youtube_mock):
+        """A playlist de uploads é derivada do channel_id, sem gastar quota."""
+        self._run(youtube_mock, [make_playlist_item("vid_new", 10)])
+        youtube_mock.channels.assert_not_called()
+        _, kwargs = youtube_mock.playlistItems().list.call_args
+        assert kwargs["playlistId"] == "UU" + CHANNEL[2:]
+
     # --- canal sem vídeos ---
 
     def test_handles_empty_uploads(self, youtube_mock):
         """Canal sem uploads recentes não deve causar erro."""
-        state = self._run(youtube_mock, items=[])
+        self._run(youtube_mock, items=[])
         youtube_mock.playlistItems().insert.assert_not_called()
 
     # --- múltiplos vídeos mistos ---
 
-    @patch("youtube_bot.processor.MAX_VIDEOS_PER_CHANNEL", 5)
+    @patch("youtube_bot.config.MAX_VIDEOS_PER_CHANNEL", 5)
     def test_mixed_videos_only_eligible_are_inserted(self, youtube_mock):
         """Em uma lista mista, apenas os elegíveis são inseridos."""
         items = [
@@ -251,3 +279,116 @@ class TestProcessChannel:
         assert "vid_eligible" in state[CHANNEL]["processed"]
         assert "vid_liked" in state[CHANNEL]["processed"]
         assert "vid_old" in state[CHANNEL]["processed"]
+
+
+# ---------------------------------------------------------------------------
+# run — orquestração
+# ---------------------------------------------------------------------------
+
+CH_A = "UC" + "a" * 22
+CH_B = "UC" + "b" * 22
+
+
+class TestRun:
+    def _patch_reads(self, monkeypatch):
+        monkeypatch.setattr("youtube_bot.processor.get_liked_videos", lambda yt, st: set())
+        monkeypatch.setattr(
+            "youtube_bot.processor.get_all_playlist_video_ids", lambda yt, ids: set()
+        )
+
+    def test_error_in_one_channel_does_not_stop_others(self, monkeypatch):
+        self._patch_reads(monkeypatch)
+        calls = []
+
+        def fake_process(youtube, channel_id, *args):
+            calls.append(channel_id)
+            if channel_id == CH_A:
+                raise RuntimeError("boom")
+            from youtube_bot.processor import ChannelResult
+            return ChannelResult(channel_id, "PL" + "x" * 16, added=["v1"])
+
+        monkeypatch.setattr("youtube_bot.processor.process_channel", fake_process)
+        report = run(MagicMock(), {CH_A: "PL1", CH_B: "PL2"}, {})
+
+        assert calls == [CH_A, CH_B]
+        assert [c.channel_id for c in report.failed] == [CH_A]
+        assert report.total_added == 1
+
+    def test_quota_exceeded_stops_all_channels(self, monkeypatch):
+        self._patch_reads(monkeypatch)
+        calls = []
+
+        def fake_process(youtube, channel_id, *args):
+            calls.append(channel_id)
+            raise QuotaExceededError("quota")
+
+        monkeypatch.setattr("youtube_bot.processor.process_channel", fake_process)
+        report = run(MagicMock(), {CH_A: "PL1", CH_B: "PL2"}, {})
+
+        assert calls == [CH_A]
+        assert report.quota_exceeded is True
+        assert report.failed == []
+
+    def test_quota_exceeded_during_initial_reads(self, monkeypatch):
+        def raise_quota(*_):
+            raise QuotaExceededError("quota")
+
+        monkeypatch.setattr("youtube_bot.processor.get_liked_videos", raise_quota)
+        report = run(MagicMock(), {CH_A: "PL1"}, {})
+
+        assert report.quota_exceeded is True
+        assert report.channels == []
+
+
+# ---------------------------------------------------------------------------
+# main — entrypoint
+# ---------------------------------------------------------------------------
+
+class TestMain:
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("YT_CHANNEL_PLAYLIST_MAP", json.dumps({CH_A: "PL" + "x" * 16}))
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        monkeypatch.setattr("youtube_bot.processor.load_creds", lambda state: MagicMock())
+        monkeypatch.setattr("youtube_bot.processor.build", lambda *a, **k: MagicMock())
+        return tmp_path, summary
+
+    def _fake_run(self, monkeypatch, report_factory):
+        monkeypatch.setattr("youtube_bot.processor.run", lambda yt, m, st: report_factory())
+
+    def test_success_returns_zero_and_writes_summary(self, env, monkeypatch):
+        from youtube_bot.processor import ChannelResult, RunReport, main
+
+        tmp_path, summary = env
+        self._fake_run(
+            monkeypatch,
+            lambda: RunReport(channels=[ChannelResult(CH_A, "PL", added=["v1"])]),
+        )
+
+        assert main() == 0
+        assert "Vídeos adicionados: **1**" in summary.read_text()
+        state = json.loads((tmp_path / "state.json").read_text())
+        assert state["_last_run"]["added"] == 1
+
+    def test_failed_channel_returns_one(self, env, monkeypatch):
+        from youtube_bot.processor import ChannelResult, RunReport, main
+
+        self._fake_run(
+            monkeypatch, lambda: RunReport(channels=[ChannelResult(CH_A, "PL", error="x")])
+        )
+        assert main() == 1
+
+    def test_state_saved_even_when_auth_fails(self, env, monkeypatch):
+        from youtube_bot.processor import main
+
+        tmp_path, _ = env
+
+        def boom(state):
+            raise RuntimeError("auth")
+
+        monkeypatch.setattr("youtube_bot.processor.load_creds", boom)
+        with pytest.raises(RuntimeError):
+            main()
+        assert (tmp_path / "state.json").exists()
