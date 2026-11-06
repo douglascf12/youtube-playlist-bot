@@ -24,10 +24,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -40,7 +40,7 @@ jobs:
       # seria regravado depois do primeiro save. Por isso a chave leva o
       # run_id e a restauração usa o prefixo (pega o mais recente).
       - name: Restore state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: state.json
           key: youtube-state-${{ github.run_id }}
@@ -60,7 +60,7 @@ jobs:
       # Salva o state mesmo se algum canal falhar
       - name: Save state
         if: always() && hashFiles('state.json') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: state.json
           key: youtube-state-${{ github.run_id }}
